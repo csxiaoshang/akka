@@ -10,7 +10,6 @@ import scala.util.Success
 
 import com.typesafe.config.ConfigFactory
 import org.scalatest.wordspec.AnyWordSpecLike
-
 import akka.actor.testkit.typed.scaladsl.ActorTestKit
 import akka.actor.testkit.typed.scaladsl.LogCapturing
 import akka.actor.testkit.typed.scaladsl.ScalaTestWithActorTestKit
@@ -253,6 +252,37 @@ class ClusterShardingSpec
 
     "EntityRef - tell" in {
       val charlieRef = sharding.entityRefFor(typeKeyWithEnvelopes, "charlie")
+
+      val p = TestProbe[String]()
+
+      charlieRef ! WhoAreYou(p.ref)
+      p.receiveMessage() should startWith("I'm charlie")
+
+      charlieRef.tell(WhoAreYou(p.ref))
+      p.receiveMessage() should startWith("I'm charlie")
+
+      charlieRef ! StopPlz()
+    }
+
+    "EntityRef - tell (using system.entityRefFor) " in {
+      val typeKeyWithEnvelopes = akka.actor.typed.EntityTypeKey[TestProtocol]("envelope-shard")
+      val charlieRef = system.entityRefFor(typeKeyWithEnvelopes, "charlie")
+
+      val p = TestProbe[String]()
+
+      charlieRef ! WhoAreYou(p.ref)
+      p.receiveMessage() should startWith("I'm charlie")
+
+      charlieRef.tell(WhoAreYou(p.ref))
+      p.receiveMessage() should startWith("I'm charlie")
+
+      charlieRef ! StopPlz()
+    }
+
+    "EntityRef - tell (using system.initEntity system.entityRefFor) " in {
+      val typeKeyWithEnvelopes = akka.actor.typed.EntityTypeKey[TestProtocol]("envelope-shard-2")
+      system.initEntity(akka.actor.typed.Entity(typeKeyWithEnvelopes)(ctx => behavior(ctx.shard)))
+      val charlieRef = system.entityRefFor(typeKeyWithEnvelopes, "charlie")
 
       val p = TestProbe[String]()
 

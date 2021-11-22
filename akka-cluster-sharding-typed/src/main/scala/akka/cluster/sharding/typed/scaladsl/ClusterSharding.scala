@@ -7,9 +7,11 @@ package scaladsl
 
 import scala.concurrent.Future
 import scala.reflect.ClassTag
+
 import akka.actor.typed.ActorRef
 import akka.actor.typed.ActorSystem
 import akka.actor.typed.Behavior
+import akka.actor.typed.Entity.EntityCommand
 import akka.actor.typed.Extension
 import akka.actor.typed.ExtensionId
 import akka.actor.typed.ExtensionSetup
@@ -39,7 +41,7 @@ object ClusterSharding extends ExtensionId[ClusterSharding] {
    *
    * Not for user extension.
    */
-  @DoNotInherit trait ShardCommand
+  @DoNotInherit trait ShardCommand extends EntityCommand
 
   /**
    * The entity can request passivation by sending the [[Passivate]] message
