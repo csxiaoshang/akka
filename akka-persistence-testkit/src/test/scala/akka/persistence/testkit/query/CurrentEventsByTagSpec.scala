@@ -23,20 +23,8 @@ class CurrentEventsByTagSpec
 
   implicit val classic: akka.actor.ActorSystem = system.classicSystem
 
-  val queries =
+  private val queries =
     PersistenceQuery(system).readJournalFor[PersistenceTestKitReadJournal](PersistenceTestKitReadJournal.Identifier)
-
-  def setup(persistenceId: String): ActorRef[Command] = {
-    val probe = createTestProbe[Done]()
-    val ref = setupEmpty(persistenceId)
-    ref ! Command(s"$persistenceId-1", probe.ref)
-    ref ! Command(s"$persistenceId-2", probe.ref)
-    ref ! Command(s"$persistenceId-3", probe.ref)
-    probe.expectMessage(Done)
-    probe.expectMessage(Done)
-    probe.expectMessage(Done)
-    ref
-  }
 
   def setupEmpty(persistenceId: String): ActorRef[Command] = {
     spawn(

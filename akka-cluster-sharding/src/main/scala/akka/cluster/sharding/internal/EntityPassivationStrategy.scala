@@ -7,11 +7,14 @@ package akka.cluster.sharding.internal
 import akka.annotation.InternalApi
 import akka.cluster.sharding.ClusterShardingSettings
 import akka.cluster.sharding.ShardRegion.EntityId
-import akka.util.{ FrequencyList, OptionVal, RecencyList }
+import akka.util.{ FrequencyList, RecencyList, SegmentedRecencyList }
 
 import scala.collection.immutable
 import scala.concurrent.duration.FiniteDuration
 
+/**
+ * INTERNAL API
+ */
 @InternalApi
 private[akka] object EntityPassivationStrategy {
   type PassivateEntities = immutable.Seq[EntityId]
@@ -24,26 +27,34 @@ private[akka] object EntityPassivationStrategy {
     settings.passivationStrategy match {
       case ClusterShardingSettings.IdlePassivationStrategy(timeout, interval) =>
         new IdleEntityPassivationStrategy(new IdleCheck(timeout, interval))
-      case ClusterShardingSettings.LeastRecentlyUsedPassivationStrategy(limit, idle) =>
+      case ClusterShardingSettings.LeastRecentlyUsedPassivationStrategy(limit, segmented, idle) =>
         val idleCheck = idle.map(idle => new IdleCheck(idle.timeout, idle.interval))
-        new LeastRecentlyUsedEntityPassivationStrategy(limit, idleCheck)
+        if (segmented.isEmpty) new LeastRecentlyUsedEntityPassivationStrategy(limit, idleCheck)
+        else new SegmentedLeastRecentlyUsedEntityPassivationStrategy(limit, segmented, idleCheck)
       case ClusterShardingSettings.MostRecentlyUsedPassivationStrategy(limit, idle) =>
         val idleCheck = idle.map(idle => new IdleCheck(idle.timeout, idle.interval))
         new MostRecentlyUsedEntityPassivationStrategy(limit, idleCheck)
-      case ClusterShardingSettings.LeastFrequentlyUsedPassivationStrategy(limit, idle) =>
+      case ClusterShardingSettings.LeastFrequentlyUsedPassivationStrategy(limit, dynamicAging, idle) =>
         val idleCheck = idle.map(idle => new IdleCheck(idle.timeout, idle.interval))
-        new LeastFrequentlyUsedEntityPassivationStrategy(limit, idleCheck)
+        new LeastFrequentlyUsedEntityPassivationStrategy(limit, dynamicAging, idleCheck)
       case _ => DisabledEntityPassivationStrategy
     }
   }
 }
 
 /**
- * An entity passivation strategy, which is instantiated per active shard.
+ * INTERNAL API: An entity passivation strategy, which is instantiated per active shard.
  */
 @InternalApi
 private[akka] sealed abstract class EntityPassivationStrategy {
   import EntityPassivationStrategy.PassivateEntities
+
+  /**
+   * The per-region active entity limit has been updated, which can trigger passivation.
+   * @param newLimit the new per-region active entity limit
+   * @return entities to passivate in the associated shard
+   */
+  def limitUpdated(newLimit: Int): PassivateEntities
 
   /**
    * Active shards in this region have been updated, which can trigger passivation.
@@ -53,17 +64,11 @@ private[akka] sealed abstract class EntityPassivationStrategy {
   def shardsUpdated(activeShards: Int): PassivateEntities
 
   /**
-   * A new entity instance has been created, which can trigger passivation.
-   * @param id entity id for the new entity instance
-   * @return entities to passivate, when active capacity has been reached
-   */
-  def entityCreated(id: EntityId): PassivateEntities
-
-  /**
    * An entity instance has been touched. Recorded before message delivery.
    * @param id entity id for the touched entity instance
+   * @return entities to passivate, when active capacity has been reached
    */
-  def entityTouched(id: EntityId): Unit
+  def entityTouched(id: EntityId): PassivateEntities
 
   /**
    * An entity instance has been terminated and should be removed from active tracking.
@@ -85,25 +90,28 @@ private[akka] sealed abstract class EntityPassivationStrategy {
 }
 
 /**
- * No-op passivation strategy for when automatic passivation is disabled.
+ * INTERNAL API: No-op passivation strategy for when automatic passivation is disabled.
  */
 @InternalApi
 private[akka] object DisabledEntityPassivationStrategy extends EntityPassivationStrategy {
   import EntityPassivationStrategy.PassivateEntities
 
+  override def limitUpdated(newLimit: Int): PassivateEntities = PassivateEntities.none
   override def shardsUpdated(activeShards: Int): PassivateEntities = PassivateEntities.none
-  override def entityCreated(id: EntityId): PassivateEntities = PassivateEntities.none
-  override def entityTouched(id: EntityId): Unit = ()
+  override def entityTouched(id: EntityId): PassivateEntities = PassivateEntities.none
   override def entityTerminated(id: EntityId): Unit = ()
   override def scheduledInterval: Option[FiniteDuration] = None
   override def intervalPassed(): PassivateEntities = PassivateEntities.none
 }
 
+/**
+ * INTERNAL API
+ */
 @InternalApi
 private[akka] final class IdleCheck(val timeout: FiniteDuration, val interval: FiniteDuration)
 
 /**
- * Passivates entities when they have not received a message for a specified length of time.
+ * INTERNAL API: Passivates entities when they have not received a message for a specified length of time.
  * @param idleCheck passivate idle entities after the given timeout, checking every interval
  */
 @InternalApi
@@ -115,14 +123,14 @@ private[akka] final class IdleEntityPassivationStrategy(idleCheck: IdleCheck) ex
 
   override val scheduledInterval: Option[FiniteDuration] = Some(idleCheck.interval)
 
+  override def limitUpdated(newLimit: Int): PassivateEntities = PassivateEntities.none
+
   override def shardsUpdated(activeShards: Int): PassivateEntities = PassivateEntities.none
 
-  override def entityCreated(id: EntityId): PassivateEntities = {
+  override def entityTouched(id: EntityId): PassivateEntities = {
     recencyList.update(id)
     PassivateEntities.none
   }
-
-  override def entityTouched(id: EntityId): Unit = recencyList.update(id)
 
   override def entityTerminated(id: EntityId): Unit = recencyList.remove(id)
 
@@ -130,39 +138,60 @@ private[akka] final class IdleEntityPassivationStrategy(idleCheck: IdleCheck) ex
 }
 
 /**
- * Passivate the least recently used entities when the number of active entities in a shard region
+ * INTERNAL API: Shared base class for limit-based passivation strategies.
+ * @param initialLimit initial active entity capacity for a shard region
+ */
+@InternalApi
+private[akka] abstract class LimitBasedEntityPassivationStrategy(initialLimit: Int) extends EntityPassivationStrategy {
+  import EntityPassivationStrategy.PassivateEntities
+
+  protected var activeShards: Int = 1
+  protected var perRegionLimit: Int = initialLimit
+  protected var perShardLimit: Int = perRegionLimit
+
+  override def limitUpdated(newPerRegionLimit: Int): PassivateEntities = {
+    perRegionLimit = newPerRegionLimit
+    perShardLimit = perRegionLimit / activeShards
+    passivateEntitiesOnLimitUpdate()
+  }
+
+  override def shardsUpdated(newActiveShards: Int): PassivateEntities = {
+    activeShards = newActiveShards
+    perShardLimit = perRegionLimit / activeShards
+    passivateEntitiesOnLimitUpdate()
+  }
+
+  protected def passivateEntitiesOnLimitUpdate(): PassivateEntities
+}
+
+/**
+ * INTERNAL API: Passivate the least recently used entities when the number of active entities in a shard region
  * reaches a limit. The per-region limit is divided evenly among the active shards in a region.
- * @param perRegionLimit active entity capacity for a shard region
+ * @param initialLimit initial active entity capacity for a shard region
  * @param idleCheck optionally passivate idle entities after the given timeout, checking every interval
  */
 @InternalApi
-private[akka] final class LeastRecentlyUsedEntityPassivationStrategy(perRegionLimit: Int, idleCheck: Option[IdleCheck])
-    extends EntityPassivationStrategy {
+private[akka] final class LeastRecentlyUsedEntityPassivationStrategy(initialLimit: Int, idleCheck: Option[IdleCheck])
+    extends LimitBasedEntityPassivationStrategy(initialLimit) {
 
   import EntityPassivationStrategy.PassivateEntities
 
-  private var perShardLimit: Int = perRegionLimit
   private val recencyList = RecencyList.empty[EntityId]
 
   override val scheduledInterval: Option[FiniteDuration] = idleCheck.map(_.interval)
 
-  override def shardsUpdated(activeShards: Int): PassivateEntities = {
-    perShardLimit = perRegionLimit / activeShards
-    passivateExcessEntities()
-  }
-
-  override def entityCreated(id: EntityId): PassivateEntities = {
+  override def entityTouched(id: EntityId): PassivateEntities = {
     recencyList.update(id)
     passivateExcessEntities()
   }
-
-  override def entityTouched(id: EntityId): Unit = recencyList.update(id)
 
   override def entityTerminated(id: EntityId): Unit = recencyList.remove(id)
 
   override def intervalPassed(): PassivateEntities = idleCheck.fold(PassivateEntities.none) { idle =>
     recencyList.removeLeastRecentOutside(idle.timeout)
   }
+
+  override protected def passivateEntitiesOnLimitUpdate(): PassivateEntities = passivateExcessEntities()
 
   private def passivateExcessEntities(): PassivateEntities = {
     val excess = recencyList.size - perShardLimit
@@ -171,39 +200,83 @@ private[akka] final class LeastRecentlyUsedEntityPassivationStrategy(perRegionLi
 }
 
 /**
- * Passivate the most recently used entities when the number of active entities in a shard region
+ * INTERNAL API
+ *
+ * Passivate the least recently used entities when the number of active entities in a shard region
  * reaches a limit. The per-region limit is divided evenly among the active shards in a region.
- * @param perRegionLimit active entity capacity for a shard region
+ * Active entities are tracked in multiple recency lists, where entities are promoted to higher-level
+ * segments on subsequent accesses, and demoted through levels when segments become full.
+ * The proportions of the segmented levels can be configured as fractions of the overall limit.
+ * @param initialLimit initial active entity capacity for a shard region
+ * @param proportions proportions of the segmented levels
  * @param idleCheck optionally passivate idle entities after the given timeout, checking every interval
  */
 @InternalApi
-private[akka] final class MostRecentlyUsedEntityPassivationStrategy(perRegionLimit: Int, idleCheck: Option[IdleCheck])
-    extends EntityPassivationStrategy {
+private[akka] final class SegmentedLeastRecentlyUsedEntityPassivationStrategy(
+    initialLimit: Int,
+    proportions: immutable.Seq[Double],
+    idleCheck: Option[IdleCheck])
+    extends LimitBasedEntityPassivationStrategy(initialLimit) {
 
   import EntityPassivationStrategy.PassivateEntities
 
-  private var perShardLimit: Int = perRegionLimit
+  private def limits: immutable.Seq[Int] = proportions.map(p => (p * perShardLimit).toInt)
+
+  private val segmentedRecencyList =
+    if (idleCheck.isDefined) SegmentedRecencyList.withOverallRecency.empty[EntityId](limits)
+    else SegmentedRecencyList.empty[EntityId](limits)
+
+  override val scheduledInterval: Option[FiniteDuration] = idleCheck.map(_.interval)
+
+  override def entityTouched(id: EntityId): PassivateEntities = {
+    segmentedRecencyList.update(id)
+    passivateExcessEntities()
+  }
+
+  override def entityTerminated(id: EntityId): Unit = segmentedRecencyList.remove(id)
+
+  override def intervalPassed(): PassivateEntities = idleCheck.fold(PassivateEntities.none) { idle =>
+    segmentedRecencyList.removeOverallLeastRecentOutside(idle.timeout)
+  }
+
+  override protected def passivateEntitiesOnLimitUpdate(): PassivateEntities = {
+    segmentedRecencyList.updateLimits(limits)
+    passivateExcessEntities()
+  }
+
+  private def passivateExcessEntities(): PassivateEntities = segmentedRecencyList.removeLeastRecentOverLimit()
+}
+
+/**
+ * INTERNAL API
+ *
+ * Passivate the most recently used entities when the number of active entities in a shard region
+ * reaches a limit. The per-region limit is divided evenly among the active shards in a region.
+ * @param initialLimit initial active entity capacity for a shard region
+ * @param idleCheck optionally passivate idle entities after the given timeout, checking every interval
+ */
+@InternalApi
+private[akka] final class MostRecentlyUsedEntityPassivationStrategy(initialLimit: Int, idleCheck: Option[IdleCheck])
+    extends LimitBasedEntityPassivationStrategy(initialLimit) {
+
+  import EntityPassivationStrategy.PassivateEntities
+
   private val recencyList = RecencyList.empty[EntityId]
 
   override val scheduledInterval: Option[FiniteDuration] = idleCheck.map(_.interval)
 
-  override def shardsUpdated(activeShards: Int): PassivateEntities = {
-    perShardLimit = perRegionLimit / activeShards
-    passivateExcessEntities()
-  }
-
-  override def entityCreated(id: EntityId): PassivateEntities = {
+  override def entityTouched(id: EntityId): PassivateEntities = {
     recencyList.update(id)
     passivateExcessEntities(skip = 1) // remove most recent before adding this created entity
   }
-
-  override def entityTouched(id: EntityId): Unit = recencyList.update(id)
 
   override def entityTerminated(id: EntityId): Unit = recencyList.remove(id)
 
   override def intervalPassed(): PassivateEntities = idleCheck.fold(PassivateEntities.none) { idle =>
     recencyList.removeLeastRecentOutside(idle.timeout)
   }
+
+  override protected def passivateEntitiesOnLimitUpdate(): PassivateEntities = passivateExcessEntities()
 
   private def passivateExcessEntities(skip: Int = 0): PassivateEntities = {
     val excess = recencyList.size - perShardLimit
@@ -212,37 +285,38 @@ private[akka] final class MostRecentlyUsedEntityPassivationStrategy(perRegionLim
 }
 
 /**
+ * INTERNAL API
+ *
  * Passivate the least frequently used entities when the number of active entities in a shard region
  * reaches a limit. The per-region limit is divided evenly among the active shards in a region.
- * @param perRegionLimit active entity capacity for a shard region
+ * @param initialLimit initial active entity capacity for a shard region
+ * @param dynamicAging whether to apply "dynamic aging" as entities are passivated
  * @param idleCheck optionally passivate idle entities after the given timeout, checking every interval
  */
 @InternalApi
 private[akka] final class LeastFrequentlyUsedEntityPassivationStrategy(
-    perRegionLimit: Int,
+    initialLimit: Int,
+    dynamicAging: Boolean,
     idleCheck: Option[IdleCheck])
-    extends EntityPassivationStrategy {
+    extends LimitBasedEntityPassivationStrategy(initialLimit) {
 
   import EntityPassivationStrategy.PassivateEntities
 
-  private var perShardLimit: Int = perRegionLimit
   private val frequencyList =
-    if (idleCheck.isDefined) FrequencyList.withOverallRecency.empty[EntityId]
-    else FrequencyList.empty[EntityId]
+    if (idleCheck.isDefined) FrequencyList.withOverallRecency.empty[EntityId](dynamicAging)
+    else FrequencyList.empty[EntityId](dynamicAging)
 
   override val scheduledInterval: Option[FiniteDuration] = idleCheck.map(_.interval)
 
-  override def shardsUpdated(activeShards: Int): PassivateEntities = {
-    perShardLimit = perRegionLimit / activeShards
-    passivateExcessEntities()
-  }
-
-  override def entityCreated(id: EntityId): PassivateEntities = {
+  override def entityTouched(id: EntityId): PassivateEntities = {
+    // first remove excess entities so that dynamic aging is updated
+    // and the adjusted age is applied to any new entities on update
+    // adjust the expected size by 1 if this is a newly activated entity
+    val adjustment = if (frequencyList.contains(id)) 0 else 1
+    val passivated = passivateExcessEntities(adjustment)
     frequencyList.update(id)
-    passivateExcessEntities(skip = OptionVal.Some(id)) // make sure the newly created entity is still active
+    passivated
   }
-
-  override def entityTouched(id: EntityId): Unit = frequencyList.update(id)
 
   override def entityTerminated(id: EntityId): Unit = frequencyList.remove(id)
 
@@ -250,8 +324,11 @@ private[akka] final class LeastFrequentlyUsedEntityPassivationStrategy(
     frequencyList.removeOverallLeastRecentOutside(idle.timeout)
   }
 
-  private def passivateExcessEntities(skip: OptionVal[EntityId] = OptionVal.none[EntityId]): PassivateEntities = {
-    val excess = frequencyList.size - perShardLimit
-    if (excess > 0) frequencyList.removeLeastFrequent(excess, skip) else PassivateEntities.none
+  override protected def passivateEntitiesOnLimitUpdate(): PassivateEntities = passivateExcessEntities()
+
+  private def passivateExcessEntities(adjustment: Int = 0): PassivateEntities = {
+    val excess = frequencyList.size - perShardLimit + adjustment
+    if (excess > 0) frequencyList.removeLeastFrequent(excess) else PassivateEntities.none
   }
+
 }
